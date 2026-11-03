@@ -509,6 +509,8 @@ describe('write-path redaction sees through invisible characters', () => {
   });
 
   it('bumps the policy version, because what reaches the trace changed', () => {
-    expect(REDACTION_POLICY_VERSION).toBe(5);
+    // v6 stopped the entropy sweep eating the character that ends a JSON escape, so the same body
+    // recorded under v5 and v6 differs wherever a flagged token followed a `\n`.
+    expect(REDACTION_POLICY_VERSION).toBe(6);
   });
 });

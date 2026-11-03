@@ -108,3 +108,121 @@ describe('replay across the inline/blob spill boundary', () => {
     }
   });
 });
+
+/**
+ * A BODY THE SWEEP MUST NOT BREAK.
+ *
+ * The entropy sweep judged runs of `[A-Za-z0-9_-]`, and `n` — the second half of the JSON escape
+ * `\n` — is one of them. A base62 `toolu_*` id sitting right after a newline was therefore matched
+ * from the `n`, the `n` went into the placeholder with the rest of the id, and the lone `\` left
+ * in front of it was not a legal JSON escape. The stored body stopped parsing and `orca replay`
+ * died on it while *loading* the trace:
+ *
+ *   error replay.failed
+ *     Bad escaped character in JSON at position 6907 (line 1 column 6908)
+ *
+ * `--loose` did not help: the exception was thrown while parsing the stored bodies, before any
+ * matching happened. The recorder said nothing — it exits 0 and reports a healthy run — so the
+ * damage surfaced at replay time, in another process, hours later.
+ *
+ * Any Claude Code session carrying the claude.ai tool set was likely to hit it: the request body
+ * holds ~146 `mcp__claude_ai_*` tool names next to `toolu_*` ids, and base62 clears the sweep's
+ * 4.0 bits/char threshold.
+ */
+describe('a request body the entropy sweep must not break', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'orca-escape-'));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  /** An id under `id`, which the protocol exemption keeps — so it cannot be the one that broke. */
+  const PROTOCOL_ID = 'toolu_01A9CkVfSMkVsjE7HB2nQrPz';
+  /** The same shape of id, but in a position no exemption covers, right after a newline. */
+  const SWEPT_ID = 'toolu_01AbCdEfGhIjKlMnOpQrStUvXy';
+
+  function body(padding: string): string {
+    const tools = Array.from(
+      { length: 12 },
+      (_, i) => `mcp__claude_ai_Gmail__apply_sensitive_message_label_${i}`,
+    );
+    return JSON.stringify({
+      model: 'claude-opus-5',
+      max_tokens: 1024,
+      system: `You are a coding agent. ${padding}`,
+      tools,
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: PROTOCOL_ID, name: 'Bash' }],
+        },
+      ],
+      scratch: `\n${SWEPT_ID}\n${tools.join('\n')}`,
+    });
+  }
+
+  async function writeRun(rawRequest: string): Promise<string> {
+    const writer = await TraceWriter.create(dir, {
+      adapter: { id: 'claude-code', version: '0.0.0' },
+      argv: ['claude-code'],
+      cwd: dir,
+      orcaVersion: '0.0.0',
+    });
+    await writer.append({
+      type: 'model.request',
+      actor: 'agent',
+      turn: 1,
+      attrs: { model: 'claude-opus-5', dialect: 'anthropic' },
+      payload: rawRequest,
+    });
+    await writer.append({
+      type: 'model.response',
+      actor: 'model',
+      turn: 1,
+      attrs: { model: 'claude-opus-5', status: 200, streamed: false },
+      payload: JSON.stringify({ id: 'msg_1', content: [{ type: 'text', text: 'done' }] }),
+    });
+    await writer.close(0);
+    return writer.runDir;
+  }
+
+  it('replays a body that spilled into a blob', async () => {
+    const raw = body('Follow the repository conventions. '.repeat(200));
+    expect(Buffer.byteLength(raw)).toBeGreaterThan(INLINE_PAYLOAD_LIMIT);
+
+    const reader = await TraceReader.open(await writeRun(raw));
+    // The premise: this body really did spill, so the blob holds the writer's escaped copy.
+    const events = await reader.events();
+    expect(isBlobRef(events.find((e) => e.type === 'model.request')?.payload)).toBe(true);
+
+    const [exchange] = await loadExchanges(reader);
+    expect(() => JSON.parse(exchange!.rawRequest)).not.toThrow();
+    expect(exchange!.canonicalRequest.model).toBe('claude-opus-5');
+  });
+
+  it('replays a body that stayed inline', async () => {
+    const raw = body('Follow the repository conventions.');
+    expect(Buffer.byteLength(raw)).toBeLessThan(INLINE_PAYLOAD_LIMIT);
+
+    const reader = await TraceReader.open(await writeRun(raw));
+    const events = await reader.events();
+    expect(isBlobRef(events.find((e) => e.type === 'model.request')?.payload)).toBe(false);
+
+    const [exchange] = await loadExchanges(reader);
+    expect(() => JSON.parse(exchange!.rawRequest)).not.toThrow();
+    expect(exchange!.canonicalRequest.model).toBe('claude-opus-5');
+  });
+
+  it('keeps the id out of the body it did not protect', async () => {
+    const raw = body('Follow the repository conventions. '.repeat(200));
+    const [exchange] = await loadExchanges(await TraceReader.open(await writeRun(raw)));
+    // The protocol id under `id` survives — the API demands its shape — and the one in the open
+    // field does not.
+    expect(exchange!.rawRequest).toContain(PROTOCOL_ID);
+    expect(exchange!.rawRequest).not.toContain(SWEPT_ID);
+  });
+});

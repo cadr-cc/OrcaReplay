@@ -11,7 +11,9 @@ import type { RedactionRecord } from '@orcareplay/schema';
 // recorded under v3 and v4 differs, and a reader has to be able to tell that from the content
 // differing. v5 judges a value a second time with its invisible characters removed, so a key with
 // a zero-width space, a BOM or a Hangul filler inside it is now redacted where v4 wrote it out.
-export const REDACTION_POLICY_VERSION = 5;
+// v6 stopped the entropy sweep eating the character that ends a JSON escape, so the same body
+// recorded under v5 and v6 differs wherever a flagged token followed a `\n`.
+export const REDACTION_POLICY_VERSION = 6;
 
 /** Environment capture is allowlist-only (spec §5). Everything else is denied. */
 export const DEFAULT_ENV_ALLOWLIST = [
@@ -451,6 +453,54 @@ const PLACEHOLDER = /<secret:[a-z_]+:[0-9a-f]{8}>/g;
 const MIN_ENTROPY_LENGTH = 20;
 const ENTROPY_BITS_PER_CHAR = 4.0;
 
+/**
+ * The characters a JSON escape sequence owns, as ranges.
+ *
+ * An escape is a backslash and the character after it — or, for `\u`, the `u` and four hex digits.
+ * Those characters are the *syntax* of the document, not its content, and the sweep's character
+ * class holds five of them: `b`, `f`, `n`, `r`, `t` and `u`. A run that starts on one of them
+ * takes it with it, and what is left in front of the placeholder is a lone backslash — which is
+ * not a legal JSON escape. The stored body stopped parsing, and `orca replay` died on it while
+ * *loading* the trace, before the proxy was ever started, so `--loose` could not help. The
+ * recorder had said nothing: it exits 0 and reports a healthy run.
+ *
+ * Every backslash is treated as the start of an escape, whether or not it is itself escaped. A
+ * body stored inside an event's JSON is escaped twice — its `\n` reads `\\n` — and the escape that
+ * has to survive is the inner one, so the outer backslash may not swallow it.
+ *
+ * Ranges are sorted by start and do not overlap. A backslash is not a token character, so it ends
+ * the run before it, and the run after it starts inside the range: a range can only ever cover
+ * the *beginning* of a run, which is what makes the sweep's correction a single shift.
+ */
+function escapeRanges(value: string): [number, number][] {
+  const ranges: [number, number][] = [];
+  for (let i = 0; i < value.length; i++) {
+    if (value.charCodeAt(i) !== 0x5c) continue; // '\\'
+    const next = value.charCodeAt(i + 1);
+    let end: number;
+    if (next === 0x75)
+      end = i + 6; // '\\u' and the four hex digits after it
+    else if (
+      next === 0x62 || // '\\b'
+      next === 0x66 || // '\\f'
+      next === 0x6e || // '\\n'
+      next === 0x72 || // '\\r'
+      next === 0x74 // '\\t'
+    )
+      end = i + 2;
+    else continue; // `\"`, `\\` and `\/` own a character the sweep cannot match anyway
+    if (end > value.length) end = value.length;
+    const last = ranges[ranges.length - 1];
+    if (last !== undefined && last[1] >= i + 1) {
+      // Overlaps the range before it — a `\\uXXXX` whose hex digits hold another backslash.
+      if (end > last[1]) last[1] = end;
+    } else {
+      ranges.push([i + 1, end]);
+    }
+  }
+  return ranges;
+}
+
 /** Shannon entropy of the token's own character distribution, in bits per character. */
 function entropy(token: string): number {
   const freq = new Map<string, number>();
@@ -721,11 +771,18 @@ export class Redactor {
     if (sweep) {
       // The raw sweep's own filters, over the view: placeholders and protocol values stay exempt.
       const spans = spansOf(view.text);
+      // And the same correction the raw sweep makes, for the same reason: a run may not begin on
+      // a character a JSON escape owns.
+      const escapes = escapeRanges(view.text);
       let cursor = 0;
       let reach = -1;
+      let escaped = 0;
       for (const m of view.text.matchAll(TOKEN)) {
-        const token = m[0];
-        const start = m.index;
+        let start = m.index;
+        const end = start + m[0].length;
+        while (escaped < escapes.length && escapes[escaped]![1] <= start) escaped += 1;
+        if (escaped < escapes.length && escapes[escaped]![0] <= start) start = escapes[escaped]![1];
+        const token = view.text.slice(start, end);
         while (cursor < spans.length && spans[cursor]![0] <= start) {
           if (spans[cursor]![1] > reach) reach = spans[cursor]![1];
           cursor += 1;
@@ -733,7 +790,7 @@ export class Redactor {
         if (start + token.length <= reach) continue;
         if (token.length < MIN_ENTROPY_LENGTH || !looksRandom(token)) continue;
         if (entropy(token) <= ENTROPY_BITS_PER_CHAR) continue;
-        found.push({ a: start, b: start + token.length, kind: 'high_entropy', secret: token });
+        found.push({ a: start, b: end, kind: 'high_entropy', secret: token });
       }
     }
     found.sort((x, y) => x.a - y.a || y.b - x.b);
@@ -762,6 +819,8 @@ export class Redactor {
   ): string {
     // Placeholders already written by the pattern rules must not be rescanned as tokens.
     const spans = spansOf(value);
+    // The characters a JSON escape owns. A run that starts on one of them would take it with it.
+    const escapes = escapeRanges(value);
     let out = '';
     let cut = 0;
     // `spans.some(...)` per token walked the whole list every time, which is quadratic once a value
@@ -772,9 +831,19 @@ export class Redactor {
     // when it ends at or before that.
     let cursor = 0;
     let reach = -1;
+    // The same walk over the escape ranges, for the same reason.
+    let escaped = 0;
     for (const m of value.matchAll(TOKEN)) {
-      const token = m[0];
-      const start = m.index;
+      let start = m.index;
+      const end = start + m[0].length;
+      // A run may not begin on a character a JSON escape owns. Shifted, not skipped: skipping
+      // would leave the whole run unjudged, and the secret in it would reach the trace. What is
+      // left of the run is what gets judged, so the escape's characters count for nothing — a
+      // token of nineteen characters after an `\n` is below the threshold, exactly as the same
+      // nineteen characters are anywhere else.
+      while (escaped < escapes.length && escapes[escaped]![1] <= start) escaped += 1;
+      if (escaped < escapes.length && escapes[escaped]![0] <= start) start = escapes[escaped]![1];
+      const token = value.slice(start, end);
       while (cursor < spans.length && spans[cursor]![0] <= start) {
         if (spans[cursor]![1] > reach) reach = spans[cursor]![1];
         cursor += 1;
